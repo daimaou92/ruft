@@ -9,7 +9,7 @@ use rand::Rng;
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    str::FromStr,
+    str::{FromStr, Matches},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -21,7 +21,10 @@ use tarpc::{
     tokio_serde::formats::Json,
     // transport::channel,
 };
-use tokio::{sync::mpsc, time};
+use tokio::{
+    sync::{mpsc, Mutex},
+    time,
+};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct Log {
@@ -49,7 +52,7 @@ fn ni_to_sa(ni: &NodeID) -> Result<SocketAddr> {
     Ok(SocketAddr::from((ip, ni.1)))
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Election {
     term: u32,
     candidate_id: NodeID,
@@ -68,6 +71,21 @@ impl Election {
     }
 }
 
+#[derive(Debug)]
+struct ElectionResult {
+    election: Arc<Election>,
+    votes_received: Vec<NodeID>,
+}
+
+impl ElectionResult {
+    fn new(election: Arc<Election>) -> Self {
+        ElectionResult {
+            election,
+            votes_received: Vec::<NodeID>::new(),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct Cluster {
     members: HashSet<NodeID>,
@@ -79,6 +97,7 @@ struct Cluster {
 struct Node {
     id: NodeID,
     leader: NodeID,
+    cluster: Arc<Cluster>,
     // leader_timeout_millis: u32,
     state: NodeState,
     last_rpc_instant: tokio::time::Instant,
@@ -100,36 +119,29 @@ impl Default for Node {
             leader: (String::from(""), 0),
             state: NodeState::Follower,
             last_rpc_instant: tokio::time::Instant::now(),
-            logs: Vec::new(),
+            logs: vec![Log::default()], // Index starts at 1
             current_term: 0,
             voted_log: HashMap::new(),
             commit_index: 0,
             last_applied: 0,
             next_indices: HashMap::new(),
             match_indices: HashMap::new(),
+            cluster: Arc::new(Cluster::default()),
         }
     }
 }
 
 impl Node {
-    pub fn new(ip: String, port: u16) -> Self {
+    pub fn new(ip: String, port: u16, cluster: Arc<Cluster>) -> Self {
         Self {
             id: (ip, port),
+            cluster,
             ..Default::default()
         }
     }
 
     pub fn voted_for(&self, term: u32) -> Option<&NodeID> {
         self.voted_log.get(&term)
-    }
-
-    pub fn leader_who(&self) -> Option<&NodeID> {
-        if self.is_leader() {
-            return Some(&self.id);
-        } else if self.leader != (String::from(""), 0) {
-            return Some(&self.leader);
-        }
-        None
     }
 
     pub fn is_leader(&self) -> bool {
@@ -140,17 +152,10 @@ impl Node {
         if self.current_term > e.term {
             return Ok(false);
         }
-        let mut d = false;
-        match self.voted_for(e.term) {
-            Some(x) => {
-                if e.candidate_id == *x {
-                    d = true;
-                }
-            }
-            None => {
-                d = true;
-            }
-        }
+        let d = match self.voted_for(e.term) {
+            Some(x) => (e.candidate_id == *x),
+            None => true,
+        };
         // TODO
         if d && self.last_applied <= e.last_log_index {
             return Ok(true);
@@ -200,75 +205,97 @@ impl NodeServer {
 #[tarpc::server]
 impl NodeRPC for NodeServer {
     async fn request_vote(self, _: context::Context, e: Election) -> (u32, bool) {
-        let mut dv = false;
-        if let Ok(mut node) = self.node.write() {
-            node.last_rpc_instant = tokio::time::Instant::now();
-            if !(matches!(node.state, NodeState::Follower)) {
-                return (node.current_term, false);
+        let mut node = match self.node.write() {
+            Ok(n) => n,
+            Err(v) => {
+                println!("[request_vote] -> {}", v);
+                return (e.term, false);
             }
+        };
+        if !(matches!(node.state, NodeState::Follower)) {
+            return (e.term, false);
+        }
 
-            match node.deserves_vote(&e) {
-                Ok(b) => {
-                    dv = b;
-                }
-                Err(e) => {
-                    println!("{}", e);
-                }
-            };
-            if node.current_term < e.term {
-                node.current_term = e.term;
+        let dv = match node.deserves_vote(&e) {
+            Ok(b) => b,
+            Err(v) => {
+                println!("[request_vote] -> {}", v);
+                return (e.term, false);
             }
+        };
+        if node.current_term < e.term {
+            node.current_term = e.term;
         }
         (e.term, dv)
     }
 
-    async fn append_entries(self, _: context::Context, mut ae: AppendEntries) -> (u32, bool) {
+    async fn append_entries(self, _: context::Context, ae: AppendEntries) -> (u32, bool) {
         // This is always sent by the leader
-        let mut success = false;
-        if let Ok(mut node) = self.node.write() {
-            node.last_rpc_instant = tokio::time::Instant::now();
-            if ae.term < node.current_term {
-                return (node.current_term, false);
+        let mut node = match self.node.write() {
+            Ok(n) => n,
+            Err(e) => {
+                println!("[append_entries] -> {}", e);
+                return (ae.term, false);
             }
+        };
+        node.last_rpc_instant = tokio::time::Instant::now();
 
-            #[allow(clippy::if_same_then_else)] // Readability
-            if ae.prev_log_index > (node.logs.len() - 1) as u64 {
-                return (node.current_term, false);
-            } else if ae.prev_log_term != node.logs[ae.prev_log_index as usize].term {
-                return (node.current_term, false);
-            }
+        if ae.term < node.current_term {
+            return (ae.term, false);
+        }
 
-            if let Some(d) = node.logs.get((ae.prev_log_index + 1) as usize) {
-                if let Some(x) = ae.entries.get(0) {
-                    if d.term > x.term {
-                        return (node.current_term, false);
-                    }
+        {
+            let log = match node.logs.get(ae.prev_log_index as usize) {
+                Some(l) => l,
+                None => {
+                    return (ae.term, false);
                 }
-            }
-            success = true;
-            let _ = (&mut node.logs).split_off((ae.prev_log_index + 1) as usize);
-            while let Some(v) = ae.entries.pop() {
-                (&mut node.logs).push(v);
-            }
-
-            if ae.leader_commit > node.commit_index {
-                let mut index = (node.logs.len() - 1) as u64;
-                if ae.leader_commit < index {
-                    index = ae.leader_commit;
-                }
-                node.commit_index = index;
-
-                if node.commit_index > node.last_applied {
-                    node.last_applied = node.commit_index;
-                }
-            }
-
-            if ae.term > node.current_term {
-                node.current_term = ae.term;
-                node.state = NodeState::Follower;
+            };
+            if log.term != ae.prev_log_term {
+                return (ae.term, false);
             }
         }
-        (ae.term, success)
+
+        let mut offset: usize = 0;
+        for (i, e) in ae.entries.iter().enumerate() {
+            let log = match node.logs.get((ae.prev_log_index + 1) as usize + i) {
+                Some(l) => l,
+                None => {
+                    offset = i;
+                    break;
+                }
+            };
+            if log.term != e.term {
+                offset = i;
+                break;
+            }
+        }
+
+        if node.logs.len() > ae.prev_log_index as usize + offset + 2 {
+            for i in ae.prev_log_index as usize + 1 + offset..node.logs.len() {
+                node.logs.remove(i);
+            }
+            node.last_applied = ae.prev_log_index + offset as u64;
+        }
+
+        for i in offset..ae.entries.len() {
+            let l = match ae.entries.get(i) {
+                Some(l) => l,
+                None => {
+                    return (ae.term, false);
+                }
+            };
+            node.logs.push(l.clone());
+            node.last_applied = node.logs.len() as u64 - 1;
+        }
+        if ae.leader_commit > node.commit_index {
+            if ae.leader_commit > node.last_applied {
+                node.commit_index = node.last_applied;
+            } else {
+                node.commit_index = ae.leader_commit;
+            }
+        }
+        (ae.term, true)
     }
 }
 
@@ -359,6 +386,7 @@ async fn monitor_election(nc: NodeClient, tx: mpsc::Sender<bool>) {
                         node.last_rpc_instant = tokio::time::Instant::now();
                         node.state = NodeState::Candidate;
                         let tx1 = tx.clone();
+                        println!("Election for term: {}", node.current_term);
                         tokio::spawn(async move{
                             match tx1.send(true).await {
                                 Ok(_) => {},
@@ -377,44 +405,42 @@ async fn monitor_election(nc: NodeClient, tx: mpsc::Sender<bool>) {
 }
 
 async fn as_candidate(nc: NodeClient, mut rx: mpsc::Receiver<bool>) {
-    async fn execute(nc: NodeClient, node_id: NodeID) {
+    async fn execute(node_id: NodeID, e: Election, er: Arc<Mutex<ElectionResult>>) -> bool {
         let t = std::time::SystemTime::now().checked_add(std::time::Duration::from_millis(20));
         if t.is_none() {
-            println!("could not get system time for context deadline");
-            return;
+            println!("[as_candidate.execute] -> could not get system time for context deadline");
+            return false;
         }
 
         let mut ctx = context::current();
         ctx.deadline = t.unwrap();
-        let e = match nc.get_new_election() {
-            Ok(e) => e,
-            Err(v) => {
-                println!("[as_candidate] -> {}", v);
-                return;
-            }
-        };
 
         let rpcl = match client_from_node_id(&node_id).await {
             Ok(x) => x,
             Err(v) => {
-                println!("[as_candidate] -> {}", v);
-                return;
+                println!("[as_candidate.execute] -> {}", v);
+                return false;
             }
         };
 
         let (_, success) = match rpcl.request_vote(ctx, e).await {
             Ok((t, s)) => (t, s),
             Err(v) => {
-                println!("[as_candidate] -> {}", v);
-                return;
+                println!("[as_candidate.execute] -> {}", v);
+                return false;
             }
         };
         // TODO
         if success {
-            println!("got vote for: {:?}", node_id);
+            let mut erguard = er.as_ref().lock().await;
+            erguard.votes_received.push(node_id);
         } else {
-            println!("didn't get vote for {:?}", node_id);
+            println!(
+                "[as_candidate.execute] -> didn't get vote for {:?}",
+                node_id
+            );
         }
+        false
     }
 
     let self_id = match nc.node.clone().read() {
@@ -425,19 +451,33 @@ async fn as_candidate(nc: NodeClient, mut rx: mpsc::Receiver<bool>) {
         }
     };
 
+    let election = match nc.get_new_election() {
+        Ok(e) => e,
+        Err(v) => {
+            println!("[as_candidate.execute] -> {}", v);
+            return;
+        }
+    };
+    let e1 = Arc::new(election.clone());
+    let election_result = Arc::new(Mutex::new(ElectionResult::new(e1)));
     while let Some(_b) = rx.recv().await {
         // println!("[as_cndidate] -> Got: {}", b);
         let members = nc.cluster.members.clone();
+        let mut fj = Vec::new();
         for x in members.into_iter() {
             if self_id == x {
                 continue;
             }
             let node_id = x.clone();
-            let nc1 = nc.clone();
-            tokio::spawn(async move {
-                execute(nc1, node_id).await;
-            });
+            let e = election.clone();
+            let er = election_result.clone();
+            fj.push(tokio::spawn(async move {
+                execute(node_id, e, er).await;
+            }));
         }
+        futures::future::join_all(fj).await;
+        let er = election_result.lock().await;
+        if er.votes_received.len() >= nc.cluster.majority as usize {}
     }
 }
 
@@ -526,12 +566,15 @@ async fn main() -> Result<()> {
             }
         }
     }
+    clu.majority = clu.members.len() as u16 / 2 + 1;
 
     let mut fts = vec![];
-    let node = Node::new(args.listen, args.port);
+
+    let arclu = Arc::new(clu);
+    let node = Node::new(args.listen, args.port, arclu.clone());
     let nid = node.id.clone();
     let amn = Arc::new(RwLock::new(node));
-    let arclu = Arc::new(clu);
+
     let (tx, rx) = mpsc::channel(1);
 
     // Start server
