@@ -11,9 +11,9 @@ cargo build
 ```
 
 This will start a server with the following default cluster configuration:
-1. 127.0.0.1:20000
-2. 127.0.0.1:20001
-3. 127.0.0.1:20002
+1. `127.0.0.1:20000`
+2. `127.0.0.1:20001`
+3. `127.0.0.1:20002`
 
 This server itself will start on port `:20000`
 
