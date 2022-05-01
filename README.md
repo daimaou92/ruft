@@ -25,6 +25,14 @@ Open up two new shells and run:
 
 Watch the logs go and use `Ctrl+C` liberally.
 
+## What works?
+
+The leadership and election bit. There's a leader lease in case only one member is active.
+
+## What doesn't work?
+
+Anything else
+
 # Dependencies:
 1. [tokio](https://github.com/tokio-rs/tokio)
 2. [tarpc](https://github.com/google/tarpc)
